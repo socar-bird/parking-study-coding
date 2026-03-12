@@ -19,9 +19,14 @@ DEFAULT_DATA = {
 
 def load_data():
     if not os.path.exists(DATA_FILE):
-        return dict(DEFAULT_DATA)
+        data = dict(DEFAULT_DATA)
+        data['_version'] = 1
+        return data
     with open(DATA_FILE, 'r', encoding='utf-8') as f:
-        return json.load(f)
+        data = json.load(f)
+    if '_version' not in data:
+        data['_version'] = 1
+    return data
 
 def save_data(data):
     # 백업
@@ -49,12 +54,25 @@ class Handler(SimpleHTTPRequestHandler):
             length = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(length)
             try:
-                data = json.loads(body)
-                save_data(data)
+                incoming = json.loads(body)
+                current = load_data()
+                incoming_version = incoming.get('_version', 0)
+                current_version = current.get('_version', 1)
+
+                if incoming_version != current_version:
+                    # 버전 충돌 → 409 Conflict + 최신 데이터 반환
+                    self.send_response(409)
+                    self.send_header('Content-Type', 'application/json; charset=utf-8')
+                    self.end_headers()
+                    self.wfile.write(json.dumps(current, ensure_ascii=False).encode('utf-8'))
+                    return
+
+                incoming['_version'] = current_version + 1
+                save_data(incoming)
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
-                self.wfile.write(b'{"ok":true}')
+                self.wfile.write(json.dumps({"ok": True, "_version": incoming['_version']}).encode('utf-8'))
             except Exception as e:
                 self.send_response(400)
                 self.end_headers()

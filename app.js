@@ -24,12 +24,30 @@ const DB = {
     }
   },
 
-  _save() {
-    fetch('/api/data', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(this._data)
-    });
+  async _save() {
+    try {
+      const res = await fetch('/api/data', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(this._data)
+      });
+      if (res.status === 409) {
+        // 다른 사람이 먼저 저장함 → 최신 데이터로 갱신
+        const latest = await res.json();
+        this._data = latest;
+        alert('다른 사용자가 데이터를 변경했습니다. 최신 데이터를 불러옵니다.');
+        renderTab();
+        return;
+      }
+      if (res.ok) {
+        const result = await res.json();
+        if (result._version) {
+          this._data._version = result._version;
+        }
+      }
+    } catch {
+      // 네트워크 오류 무시
+    }
   },
 
   get members() { return this._data?.members || []; },
@@ -82,21 +100,17 @@ const DB = {
 
   checkIn(date, memberId, goals, startTime) {
     const session = this.getOrCreateSession(date);
-    let att = session.attendances.find(a => a.memberId === memberId);
-    if (!att) {
-      att = { memberId, goals, startTime, endTime: null, review: null, reflection: '', checkedIn: true, checkedOut: false };
-      session.attendances.push(att);
-    } else {
-      att.goals = goals;
-      att.startTime = startTime;
-      att.checkedIn = true;
-    }
+    // 항상 새 attendance 추가 (여러 번 체크인 가능)
+    const att = { memberId, goals, startTime, endTime: null, review: null, reflection: '', checkedIn: true, checkedOut: false };
+    session.attendances.push(att);
     this.updateSession(session);
   },
 
-  checkOut(date, memberId, endTime, review, reflection) {
+  checkOut(date, memberId, attIndex, endTime, review, reflection) {
     const session = this.getOrCreateSession(date);
-    const att = session.attendances.find(a => a.memberId === memberId);
+    // attIndex로 정확한 attendance를 찾아 체크아웃
+    const memberAtts = session.attendances.filter(a => a.memberId === memberId);
+    const att = memberAtts[attIndex];
     if (att) {
       att.endTime = endTime;
       att.review = review;
@@ -104,6 +118,17 @@ const DB = {
       att.checkedOut = true;
     }
     this.updateSession(session);
+  },
+
+  getActiveAttendance(date, memberId) {
+    const session = this.getSession(date);
+    if (!session) return null;
+    const memberAtts = session.attendances.filter(a => a.memberId === memberId);
+    // 체크인했지만 아직 체크아웃 안 한 가장 마지막 항목
+    for (let i = memberAtts.length - 1; i >= 0; i--) {
+      if (memberAtts[i].checkedIn && !memberAtts[i].checkedOut) return { att: memberAtts[i], index: i };
+    }
+    return null;
   },
 
   isMeetingDay(date) {
@@ -286,28 +311,32 @@ function renderToday() {
   } else {
     html += '<div class="card"><div class="space-y-0">';
     members.forEach(member => {
-      const att = session?.attendances.find(a => a.memberId === member.id);
-      const checkedIn = att?.checkedIn;
-      const checkedOut = att?.checkedOut;
+      const memberAtts = session?.attendances.filter(a => a.memberId === member.id) || [];
+      const activeAtt = DB.getActiveAttendance(today, member.id);
+      const completedAtts = memberAtts.filter(a => a.checkedOut);
+      const totalMins = completedAtts.reduce((sum, a) => sum + calcMinutes(a.startTime, a.endTime), 0);
 
       let statusBadge, actionBtn;
-      if (checkedOut) {
-        const mins = calcMinutes(att.startTime, att.endTime);
-        statusBadge = `<span class="badge badge-green">${reviewEmoji(att.review)} ${formatMinutes(mins)}</span>`;
-        actionBtn = '';
-      } else if (checkedIn) {
+      if (activeAtt) {
         statusBadge = `<span class="badge badge-blue">참여 중</span>`;
-        actionBtn = `<button class="btn-primary btn-small" style="width:auto;padding:6px 14px" onclick="openCheckOut('${member.id}')">체크아웃</button>`;
+        actionBtn = `<button class="btn-primary btn-small" style="width:auto;padding:6px 14px" onclick="openCheckOut('${member.id}', ${activeAtt.index})">체크아웃</button>`;
       } else {
-        statusBadge = `<span class="badge badge-gray">대기</span>`;
-        actionBtn = `<button class="btn-secondary btn-small" style="width:auto;padding:6px 14px" onclick="openCheckIn('${member.id}')">체크인</button>`;
+        if (completedAtts.length > 0) {
+          statusBadge = `<span class="badge badge-green">${completedAtts.length}회 · ${formatMinutes(totalMins)}</span>`;
+        } else {
+          statusBadge = `<span class="badge badge-gray">대기</span>`;
+        }
+        actionBtn = `<button class="btn-secondary btn-small" style="width:auto;padding:6px 14px" onclick="openCheckIn('${member.id}')">${completedAtts.length > 0 ? '재체크인' : '체크인'}</button>`;
       }
+
+      // 현재 활성 세션의 목표 또는 마지막 완료 세션 요약
+      const displayGoals = activeAtt ? activeAtt.att.goals : (completedAtts.length > 0 ? completedAtts.map(a => a.goals).filter(Boolean).join(', ') : '');
 
       html += `<div class="list-row">
         <span class="text-2xl">${member.emoji}</span>
         <div class="flex-1 min-w-0">
           <div class="font-semibold text-text-primary dark:text-text-dark-primary">${escHtml(member.name)}</div>
-          ${att?.goals ? `<div class="text-xs text-text-secondary mt-0.5 truncate">${escHtml(att.goals)}</div>` : ''}
+          ${displayGoals ? `<div class="text-xs text-text-secondary mt-0.5 truncate">${escHtml(displayGoals)}</div>` : ''}
         </div>
         <div class="flex items-center gap-2">
           ${statusBadge}
@@ -320,7 +349,7 @@ function renderToday() {
 
   // Summary
   if (session && session.attendances.length > 0) {
-    const total = session.attendances.filter(a => a.checkedIn).length;
+    const checkedInMembers = new Set(session.attendances.filter(a => a.checkedIn).map(a => a.memberId)).size;
     const completed = session.attendances.filter(a => a.checkedOut);
     const totalMins = completed.reduce((sum, a) => sum + calcMinutes(a.startTime, a.endTime), 0);
     const avgMins = completed.length > 0 ? Math.round(totalMins / completed.length) : 0;
@@ -329,16 +358,16 @@ function renderToday() {
       <div class="text-sm font-semibold text-text-secondary mb-3">오늘 요약</div>
       <div class="flex justify-around text-center">
         <div>
-          <div class="text-2xl font-bold text-text-primary dark:text-text-dark-primary">${total}</div>
+          <div class="text-2xl font-bold text-text-primary dark:text-text-dark-primary">${checkedInMembers}</div>
           <div class="text-xs text-text-secondary mt-1">참석</div>
         </div>
         <div>
           <div class="text-2xl font-bold text-text-primary dark:text-text-dark-primary">${completed.length}</div>
-          <div class="text-xs text-text-secondary mt-1">완료</div>
+          <div class="text-xs text-text-secondary mt-1">세션</div>
         </div>
         <div>
-          <div class="text-2xl font-bold text-text-primary dark:text-text-dark-primary">${formatMinutes(avgMins)}</div>
-          <div class="text-xs text-text-secondary mt-1">평균 시간</div>
+          <div class="text-2xl font-bold text-text-primary dark:text-text-dark-primary">${formatMinutes(totalMins)}</div>
+          <div class="text-xs text-text-secondary mt-1">총 시간</div>
         </div>
       </div>
     </div>`;
@@ -394,7 +423,7 @@ function doCheckIn(memberId) {
 }
 
 // Check-out Modal
-function openCheckOut(memberId) {
+function openCheckOut(memberId, attIndex) {
   const member = getMemberById(memberId);
   if (!member) return;
 
@@ -421,7 +450,7 @@ function openCheckOut(memberId) {
         <label class="block text-sm font-semibold text-text-primary dark:text-text-dark-primary mb-2">한 줄 메모 <span class="font-normal text-text-secondary">(선택)</span></label>
         <input id="checkout-reflection" class="input-field" placeholder="배운 점, 다음에 할 것 등">
       </div>
-      <button class="btn-primary mt-2" onclick="doCheckOut('${memberId}')">체크아웃 하기</button>
+      <button class="btn-primary mt-2" onclick="doCheckOut('${memberId}', ${attIndex})">체크아웃 하기</button>
     </div>
   `);
 }
@@ -432,12 +461,12 @@ function selectReview(el, value) {
   document.getElementById('checkout-review').value = value;
 }
 
-function doCheckOut(memberId) {
+function doCheckOut(memberId, attIndex) {
   const endTime = document.getElementById('checkout-time').value;
   const review = document.getElementById('checkout-review').value;
   const reflection = document.getElementById('checkout-reflection').value.trim();
   if (!review) { alert('오늘 어땠는지 선택해주세요'); return; }
-  DB.checkOut(todayStr(), memberId, endTime, review, reflection);
+  DB.checkOut(todayStr(), memberId, attIndex, endTime, review, reflection);
   Modal.hide();
   renderToday();
 }
@@ -1047,4 +1076,18 @@ function confirmReset() {
 // ============================================================
 // Init
 // ============================================================
-DB.load().then(() => switchTab('today'));
+DB.load().then(() => {
+  switchTab('today');
+
+  // 10초마다 서버 데이터 버전 확인 → 변경 시 자동 갱신
+  setInterval(async () => {
+    try {
+      const res = await fetch('/api/data');
+      const latest = await res.json();
+      if (latest._version && DB._data._version && latest._version !== DB._data._version) {
+        DB._data = latest;
+        renderTab();
+      }
+    } catch { /* ignore */ }
+  }, 10000);
+});
