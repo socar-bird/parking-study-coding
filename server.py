@@ -5,7 +5,7 @@ from http.server import HTTPServer, SimpleHTTPRequestHandler
 from datetime import datetime
 
 DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data.json')
-PORT = 8080
+PORT = 3333
 
 DEFAULT_DATA = {
     "members": [],

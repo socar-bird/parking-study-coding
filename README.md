@@ -10,7 +10,7 @@ cd parking-study-coding
 ./start.sh
 ```
 
-브라우저에서 `http://서버IP:8080` 접속.
+브라우저에서 `http://서버IP:3333` 접속.
 
 ## 기능
 
