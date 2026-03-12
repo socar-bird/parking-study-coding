@@ -24,107 +24,110 @@ const DB = {
     }
   },
 
-  async _save() {
-    try {
-      const res = await fetch('/api/data', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(this._data)
-      });
-      if (res.status === 409) {
-        // 다른 사람이 먼저 저장함 → 최신 데이터로 갱신
-        const latest = await res.json();
-        this._data = latest;
-        alert('다른 사용자가 데이터를 변경했습니다. 최신 데이터를 불러옵니다.');
-        renderTab();
-        return;
-      }
-      if (res.ok) {
-        const result = await res.json();
-        if (result._version) {
-          this._data._version = result._version;
+  // mutationFn을 로컬 데이터에 적용 후 저장 시도.
+  // 409 충돌 시 서버 최신 데이터에 mutationFn을 재적용하여 retry (최대 3회)
+  async _applyAndSave(mutationFn) {
+    // 1차: 현재 로컬 데이터에 적용 (UI 즉시 반영)
+    mutationFn(this._data);
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const res = await fetch('/api/data', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(this._data)
+        });
+        if (res.status === 409) {
+          // 서버 최신 데이터를 받아 mutation 재적용
+          const latest = await res.json();
+          this._data = latest;
+          mutationFn(this._data);
+          continue;
         }
-      }
-    } catch {
-      // 네트워크 오류 무시
+        if (res.ok) {
+          const result = await res.json();
+          if (result._version) this._data._version = result._version;
+          return;
+        }
+      } catch { return; }
     }
+    // 3회 모두 실패 시 서버 데이터로 복원
+    await this.load();
+    renderTab();
   },
 
   get members() { return this._data?.members || []; },
-  set members(v) { this._data.members = v; this._save(); },
-
   get sessions() { return this._data?.sessions || []; },
-  set sessions(v) { this._data.sessions = v; this._save(); },
-
   get settings() { return this._data?.settings || this._defaults.settings; },
-  set settings(v) { this._data.settings = v; this._save(); },
+  set settings(v) {
+    const newSettings = JSON.parse(JSON.stringify(v));
+    this._applyAndSave(data => { data.settings = newSettings; });
+  },
 
   addMember(name, emoji) {
     const m = { id: 'm_' + Date.now(), name, emoji, createdAt: new Date().toISOString(), active: true };
-    this._data.members.push(m);
-    this._save();
+    this._applyAndSave(data => {
+      // 중복 방지: 같은 id가 이미 있으면 skip
+      if (!data.members.some(x => x.id === m.id)) data.members.push(m);
+    });
     return m;
   },
 
   toggleMember(id) {
-    const m = this._data.members.find(x => x.id === id);
-    if (m) m.active = !m.active;
-    this._save();
+    // toggle이 아니라 목표 상태를 캡처 (재적용 시 동일 결과 보장)
+    const current = this._data.members.find(x => x.id === id);
+    const targetActive = current ? !current.active : true;
+    this._applyAndSave(data => {
+      const m = data.members.find(x => x.id === id);
+      if (m) m.active = targetActive;
+    });
   },
 
   deleteMember(id) {
-    this._data.members = this._data.members.filter(x => x.id !== id);
-    this._save();
+    this._applyAndSave(data => {
+      data.members = data.members.filter(x => x.id !== id);
+    });
   },
 
   getSession(date) {
     return this._data.sessions.find(s => s.date === date);
   },
 
-  getOrCreateSession(date) {
-    let session = this._data.sessions.find(s => s.date === date);
-    if (!session) {
-      session = { id: 's_' + Date.now(), date, attendances: [] };
-      this._data.sessions.push(session);
-      this._save();
-    }
-    return session;
-  },
-
-  updateSession(session) {
-    const idx = this._data.sessions.findIndex(s => s.id === session.id);
-    if (idx >= 0) this._data.sessions[idx] = session;
-    else this._data.sessions.push(session);
-    this._save();
-  },
-
   checkIn(date, memberId, goals, startTime) {
-    const session = this.getOrCreateSession(date);
-    // 항상 새 attendance 추가 (여러 번 체크인 가능)
     const att = { memberId, goals, startTime, endTime: null, review: null, reflection: '', checkedIn: true, checkedOut: false };
-    session.attendances.push(att);
-    this.updateSession(session);
+    this._applyAndSave(data => {
+      let session = data.sessions.find(s => s.date === date);
+      if (!session) {
+        session = { id: 's_' + Date.now(), date, attendances: [] };
+        data.sessions.push(session);
+      }
+      // 중복 방지: 같은 memberId + startTime + goals 조합이 이미 있으면 skip
+      const dup = session.attendances.some(a =>
+        a.memberId === att.memberId && a.startTime === att.startTime && a.goals === att.goals
+      );
+      if (!dup) session.attendances.push(att);
+    });
   },
 
   checkOut(date, memberId, attIndex, endTime, review, reflection) {
-    const session = this.getOrCreateSession(date);
-    // attIndex로 정확한 attendance를 찾아 체크아웃
-    const memberAtts = session.attendances.filter(a => a.memberId === memberId);
-    const att = memberAtts[attIndex];
-    if (att) {
-      att.endTime = endTime;
-      att.review = review;
-      att.reflection = reflection;
-      att.checkedOut = true;
-    }
-    this.updateSession(session);
+    this._applyAndSave(data => {
+      const session = data.sessions.find(s => s.date === date);
+      if (!session) return;
+      const memberAtts = session.attendances.filter(a => a.memberId === memberId);
+      const att = memberAtts[attIndex];
+      if (att && !att.checkedOut) {
+        att.endTime = endTime;
+        att.review = review;
+        att.reflection = reflection;
+        att.checkedOut = true;
+      }
+    });
   },
 
   getActiveAttendance(date, memberId) {
     const session = this.getSession(date);
     if (!session) return null;
     const memberAtts = session.attendances.filter(a => a.memberId === memberId);
-    // 체크인했지만 아직 체크아웃 안 한 가장 마지막 항목
     for (let i = memberAtts.length - 1; i >= 0; i--) {
       if (memberAtts[i].checkedIn && !memberAtts[i].checkedOut) return { att: memberAtts[i], index: i };
     }
@@ -141,16 +144,21 @@ const DB = {
   },
 
   importData(json) {
-    const data = JSON.parse(json);
-    if (data.members) this._data.members = data.members;
-    if (data.sessions) this._data.sessions = data.sessions;
-    if (data.settings) this._data.settings = data.settings;
-    this._save();
+    const imported = JSON.parse(json);
+    this._applyAndSave(data => {
+      if (imported.members) data.members = imported.members;
+      if (imported.sessions) data.sessions = imported.sessions;
+      if (imported.settings) data.settings = imported.settings;
+    });
   },
 
   resetAll() {
-    this._data = JSON.parse(JSON.stringify(this._defaults));
-    this._save();
+    const defaults = JSON.parse(JSON.stringify(this._defaults));
+    this._applyAndSave(data => {
+      data.members = defaults.members;
+      data.sessions = defaults.sessions;
+      data.settings = defaults.settings;
+    });
   }
 };
 
@@ -956,25 +964,26 @@ function renderSettings() {
 }
 
 function saveGroupName() {
-  const settings = DB.settings;
-  settings.groupName = document.getElementById('setting-group-name').value.trim() || '스터디';
-  DB.settings = settings;
-  document.getElementById('header-title').textContent = settings.groupName;
+  const newName = document.getElementById('setting-group-name').value.trim() || '스터디';
+  DB._applyAndSave(data => { data.settings.groupName = newName; });
+  document.getElementById('header-title').textContent = newName;
 }
 
 function saveMeetingTime() {
-  const settings = DB.settings;
-  settings.meetingTime = document.getElementById('setting-meeting-time').value;
-  DB.settings = settings;
+  const newTime = document.getElementById('setting-meeting-time').value;
+  DB._applyAndSave(data => { data.settings.meetingTime = newTime; });
 }
 
 function toggleMeetingDay(dayIdx) {
-  const settings = DB.settings;
-  const idx = settings.meetingDays.indexOf(dayIdx);
-  if (idx >= 0) settings.meetingDays.splice(idx, 1);
-  else settings.meetingDays.push(dayIdx);
-  settings.meetingDays.sort();
-  DB.settings = settings;
+  // 목표 상태를 캡처: 현재 포함되어 있으면 제거, 없으면 추가
+  const shouldInclude = !DB.settings.meetingDays.includes(dayIdx);
+  DB._applyAndSave(data => {
+    const days = data.settings.meetingDays;
+    const idx = days.indexOf(dayIdx);
+    if (shouldInclude && idx < 0) days.push(dayIdx);
+    else if (!shouldInclude && idx >= 0) days.splice(idx, 1);
+    days.sort();
+  });
   renderSettings();
 }
 
