@@ -10,69 +10,74 @@ window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', (e)
   document.documentElement.classList.toggle('dark', e.matches);
 });
 
-// --- Data Layer ---
+// --- Data Layer (서버 JSON 기반) ---
 const DB = {
-  _get(key, fallback) {
-    try { return JSON.parse(localStorage.getItem(key)) || fallback; }
-    catch { return fallback; }
+  _data: null,
+  _defaults: { members: [], sessions: [], settings: { groupName: '주차 스터디', meetingDays: [2, 4], meetingTime: '19:00' } },
+
+  async load() {
+    try {
+      const res = await fetch('/api/data');
+      this._data = await res.json();
+    } catch {
+      this._data = JSON.parse(JSON.stringify(this._defaults));
+    }
   },
-  _set(key, val) { localStorage.setItem(key, JSON.stringify(val)); },
 
-  get members() { return this._get('mogakko_members', []); },
-  set members(v) { this._set('mogakko_members', v); },
-
-  get sessions() { return this._get('mogakko_sessions', []); },
-  set sessions(v) { this._set('mogakko_sessions', v); },
-
-  get settings() {
-    return this._get('mogakko_settings', {
-      groupName: '주차 스터디',
-      meetingDays: [2, 4], // 0=Sun
-      meetingTime: '19:00'
+  _save() {
+    fetch('/api/data', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(this._data)
     });
   },
-  set settings(v) { this._set('mogakko_settings', v); },
+
+  get members() { return this._data?.members || []; },
+  set members(v) { this._data.members = v; this._save(); },
+
+  get sessions() { return this._data?.sessions || []; },
+  set sessions(v) { this._data.sessions = v; this._save(); },
+
+  get settings() { return this._data?.settings || this._defaults.settings; },
+  set settings(v) { this._data.settings = v; this._save(); },
 
   addMember(name, emoji) {
-    const members = this.members;
     const m = { id: 'm_' + Date.now(), name, emoji, createdAt: new Date().toISOString(), active: true };
-    members.push(m);
-    this.members = members;
+    this._data.members.push(m);
+    this._save();
     return m;
   },
 
   toggleMember(id) {
-    const members = this.members;
-    const m = members.find(x => x.id === id);
+    const m = this._data.members.find(x => x.id === id);
     if (m) m.active = !m.active;
-    this.members = members;
+    this._save();
   },
 
   deleteMember(id) {
-    this.members = this.members.filter(x => x.id !== id);
+    this._data.members = this._data.members.filter(x => x.id !== id);
+    this._save();
   },
 
   getSession(date) {
-    return this.sessions.find(s => s.date === date);
+    return this._data.sessions.find(s => s.date === date);
   },
 
   getOrCreateSession(date) {
-    let sessions = this.sessions;
-    let session = sessions.find(s => s.date === date);
+    let session = this._data.sessions.find(s => s.date === date);
     if (!session) {
       session = { id: 's_' + Date.now(), date, attendances: [] };
-      sessions.push(session);
-      this.sessions = sessions;
+      this._data.sessions.push(session);
+      this._save();
     }
     return session;
   },
 
   updateSession(session) {
-    let sessions = this.sessions;
-    const idx = sessions.findIndex(s => s.id === session.id);
-    if (idx >= 0) sessions[idx] = session;
-    else sessions.push(session);
-    this.sessions = sessions;
+    const idx = this._data.sessions.findIndex(s => s.id === session.id);
+    if (idx >= 0) this._data.sessions[idx] = session;
+    else this._data.sessions.push(session);
+    this._save();
   },
 
   checkIn(date, memberId, goals, startTime) {
@@ -107,25 +112,20 @@ const DB = {
   },
 
   exportData() {
-    return JSON.stringify({
-      members: this.members,
-      sessions: this.sessions,
-      settings: this.settings,
-      exportedAt: new Date().toISOString()
-    }, null, 2);
+    return JSON.stringify({ ...this._data, exportedAt: new Date().toISOString() }, null, 2);
   },
 
   importData(json) {
     const data = JSON.parse(json);
-    if (data.members) this.members = data.members;
-    if (data.sessions) this.sessions = data.sessions;
-    if (data.settings) this.settings = data.settings;
+    if (data.members) this._data.members = data.members;
+    if (data.sessions) this._data.sessions = data.sessions;
+    if (data.settings) this._data.settings = data.settings;
+    this._save();
   },
 
   resetAll() {
-    localStorage.removeItem('mogakko_members');
-    localStorage.removeItem('mogakko_sessions');
-    localStorage.removeItem('mogakko_settings');
+    this._data = JSON.parse(JSON.stringify(this._defaults));
+    this._save();
   }
 };
 
@@ -1047,4 +1047,4 @@ function confirmReset() {
 // ============================================================
 // Init
 // ============================================================
-switchTab('today');
+DB.load().then(() => switchTab('today'));
